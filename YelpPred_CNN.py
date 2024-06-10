@@ -2,6 +2,7 @@ import json
 import random
 import pandas as pd
 import re
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -14,11 +15,14 @@ from transformers import get_linear_schedule_with_warmup
 from tqdm import tqdm
 from nltk.corpus import stopwords
 from torch.optim import lr_scheduler
+from sklearn.metrics import f1_score
 
 # Constants
 MAX_SEQUENCE_LENGTH = 150
 MAX_NUM_WORDS = 10000
-N_SAMPLES = 20000
+N_SAMPLES = 80000
+NUM_CLASSES = 5
+SAVE_DIR = "./model"
 
 # Clean the text data
 def clean_text(text):
@@ -127,12 +131,12 @@ def create_data_loader(texts, stars, funny, useful, cool, batch_size):
     return DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
 class MultiTaskCNNTextModel(nn.Module):
-    def __init__(self, vocab_size, embed_size, num_classes, num_filters, filter_sizes):
+    def __init__(self, vocab_size, embed_size, num_classes, num_filters, filter_sizes, dropout_rate):
         super(MultiTaskCNNTextModel, self).__init__()
         self.embedding = nn.Embedding(vocab_size, embed_size)
         self.convs = nn.ModuleList([nn.Conv2d(1, num_filters, (fs, embed_size)) for fs in filter_sizes])
         self.batch_norms = nn.ModuleList([nn.BatchNorm2d(num_filters) for _ in filter_sizes])
-        self.dropout = nn.Dropout(0.5)
+        self.dropout = nn.Dropout(dropout_rate)  # Updated line to accept dropout rate
         self.classifier = nn.Linear(len(filter_sizes) * num_filters, num_classes)
         self.regressor = nn.Linear(len(filter_sizes) * num_filters, 3)  # 3 regression targets: funny, useful, cool
 
@@ -186,6 +190,8 @@ def eval_model(model, data_loader, device):
     total_regression_loss = 0
     total_correct = 0
     total = 0
+    all_preds = []
+    all_labels = []
     mse_funny, mse_useful, mse_cool = 0, 0, 0
 
     with torch.no_grad():
@@ -209,11 +215,15 @@ def eval_model(model, data_loader, device):
             total_correct += (classification_logits.argmax(1) == stars).sum().item()
             total += stars.size(0)
 
+            all_preds.extend(classification_logits.argmax(1).cpu().numpy())
+            all_labels.extend(stars.cpu().numpy())
+
             mse_funny += regression_loss_funny.item() * texts.size(0)
             mse_useful += regression_loss_useful.item() * texts.size(0)
             mse_cool += regression_loss_cool.item() * texts.size(0)
 
     classification_accuracy = total_correct / total
+    f1 = f1_score(all_labels, all_preds, average='weighted')
     avg_classification_loss = total_classification_loss / total
     avg_regression_loss = total_regression_loss / total
     mse_funny /= total
@@ -223,7 +233,7 @@ def eval_model(model, data_loader, device):
     rmse_useful = mse_useful ** 0.5
     rmse_cool = mse_cool ** 0.5
 
-    return (classification_accuracy, avg_classification_loss, avg_regression_loss,
+    return (classification_accuracy, f1, avg_classification_loss, avg_regression_loss,
             mse_funny, mse_useful, mse_cool, rmse_funny, rmse_useful, rmse_cool)
 
 class EarlyStopping:
@@ -253,33 +263,59 @@ class EarlyStopping:
 
 early_stopping = EarlyStopping(patience=5, delta=0.01)
 
-if __name__ == '__main__':
+def random_search(params, n_iter=10):
+    """Random search for hyperparameter tuning."""
+    keys = list(params.keys())
+    best_score = None
+    best_params = None
+    
+    for _ in range(n_iter):
+        # Randomly sample a configuration
+        current_params = {k: random.choice(v) for k, v in params.items()}
+        print(f"Trying configuration: {current_params}")
+
+        # Train and evaluate the model with the current configuration
+        val_score = train_and_evaluate(current_params)
+
+        if best_score is None or val_score < best_score:  # Want to minimize loss
+            best_score = val_score
+            best_params = current_params
+
+    print(f"Best configuration: {best_params}")
+    print(f"Best validation score: {best_score}")
+    return best_params
+
+def train_and_evaluate(params):
+    """Train and evaluate the model with the given parameters."""
+    global EMBED_SIZE, NUM_FILTERS, FILTER_SIZES, DROPOUT_RATE, BATCH_SIZE
+    EMBED_SIZE = params['embed_size']
+    NUM_FILTERS = params['num_filters']
+    FILTER_SIZES = params['filter_sizes']
+    DROPOUT_RATE = params['dropout_rate']
+    LEARNING_RATE = params['learning_rate']
+    WEIGHT_DECAY = params['weight_decay']
+    BATCH_SIZE = params['batch_size']
+    
     X_train, X_valid, X_test, y_train, y_valid, y_test, vocab = data_preprocessing()
     y_train_stars, y_train_funny, y_train_useful, y_train_cool = y_train
     y_valid_stars, y_valid_funny, y_valid_useful, y_valid_cool = y_valid
-    y_test_stars, y_test_funny, y_test_useful, y_test_cool = y_test
     
-    BATCH_SIZE = 32
-    EMBED_SIZE = 100
-    NUM_CLASSES = 5
-    NUM_FILTERS = 100
-    FILTER_SIZES = [3, 4, 5]
-
     train_loader = create_data_loader(X_train, y_train_stars, y_train_funny, y_train_useful, y_train_cool, BATCH_SIZE)
     valid_loader = create_data_loader(X_valid, y_valid_stars, y_valid_funny, y_valid_useful, y_valid_cool, BATCH_SIZE)
-    test_loader = create_data_loader(X_test, y_test_stars, y_test_funny, y_test_useful, y_test_cool, BATCH_SIZE)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = MultiTaskCNNTextModel(vocab_size=len(vocab), embed_size=EMBED_SIZE, num_classes=NUM_CLASSES,
-                                  num_filters=NUM_FILTERS, filter_sizes=FILTER_SIZES)
+                                  num_filters=NUM_FILTERS, filter_sizes=FILTER_SIZES, dropout_rate=DROPOUT_RATE)
     model = model.to(device)
 
-    optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=3)
 
-    EPOCHS = 20
+    EPOCHS = 10
     early_stopping = EarlyStopping(patience=5, delta=0.01)
+
+    best_val_loss = float('inf')
 
     for epoch in range(EPOCHS):
         print(f"Epoch {epoch + 1}/{EPOCHS}")
@@ -287,28 +323,155 @@ if __name__ == '__main__':
         train_acc, train_class_loss, train_reg_loss = train_epoch(model, train_loader, optimizer, device, scheduler=None)
         print(f"Train classification loss: {train_class_loss:.4f}, Train regression loss: {train_reg_loss:.4f}, Train accuracy: {train_acc:.4f}")
 
-        (val_acc, val_class_loss, val_reg_loss,
-         mse_funny, mse_useful, mse_cool,
-         rmse_funny, rmse_useful, rmse_cool) = eval_model(model, valid_loader, device)
+        (val_acc, val_class_loss, val_reg_loss, mse_funny, mse_useful, mse_cool, rmse_funny, rmse_useful, rmse_cool) = eval_model(model, valid_loader, device)
         
         print(f"Validation classification loss: {val_class_loss:.4f}, Validation regression loss: {val_reg_loss:.4f}, Validation accuracy: {val_acc:.4f}")
         print(f"Validation MSE - Funny: {mse_funny:.4f}, Useful: {mse_useful:.4f}, Cool: {mse_cool:.4f}")
         print(f"Validation RMSE - Funny: {rmse_funny:.4f}, Useful: {rmse_useful:.4f}, Cool: {rmse_cool:.4f}")
-        
-        # Pass validation loss to scheduler
-        scheduler.step(val_class_loss + val_reg_loss)
 
-        early_stopping(val_class_loss + val_reg_loss, model)
+        val_loss = val_class_loss + val_reg_loss
+        scheduler.step(val_loss)
+
+        early_stopping(val_loss, model)
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+
         if early_stopping.early_stop:
             print("Early stopping")
             break
 
-    model.load_state_dict(torch.load('checkpoint.pt'))
+    return best_val_loss  # Return validation score for model selection
 
-    (test_acc, test_class_loss, test_reg_loss,
+def save_params(params, filepath="best_params.json"):
+    """Save parameters to a JSON file."""
+    with open(filepath, 'w') as f:
+        json.dump(params, f)
+
+def save_model(model, filepath="best_model.pth"):
+    """Save the model state to a file."""
+    torch.save(model.state_dict(), filepath)
+
+
+def load_params(filepath="best_params.json"):
+    """Load parameters from a JSON file, if it exists."""
+    if os.path.exists(filepath):
+        with open(filepath, 'r') as f:
+            params = json.load(f)
+        return params
+    return None
+
+def load_model(model, filepath="best_model.pth"):
+    """Load the model state from a file, if it exists."""
+    if os.path.exists(filepath):
+        model.load_state_dict(torch.load(filepath))
+        return model
+    return None
+
+if __name__ == '__main__':
+    fine_tuning = False
+    best_params_filepath = "best_params.json"
+    best_model_filepath = "best_model.pth"
+
+    # Load best parameters or perform random search
+    best_params = load_params(filepath=best_params_filepath)
+
+    # Prepare data loaders
+    X_train, X_valid, X_test, y_train, y_valid, y_test, vocab = data_preprocessing()
+    y_train_stars, y_train_funny, y_train_useful, y_train_cool = y_train
+    y_valid_stars, y_valid_funny, y_valid_useful, y_valid_cool = y_valid
+    y_test_stars, y_test_funny, y_test_useful, y_test_cool = y_test
+
+    if fine_tuning:
+        if best_params is None:
+            # Define the parameter grid for random search
+            param_grid = {
+                "embed_size": [50, 100, 200],
+                "num_filters": [50, 100, 150],
+                "filter_sizes": [[3, 4, 5], [2, 3, 4, 5], [3, 5, 7]],
+                "dropout_rate": [0.3, 0.5, 0.7],
+                "learning_rate": [1e-3, 1e-4, 1e-5],
+                "weight_decay": [1e-5, 1e-6, 1e-7],
+                "batch_size": [32, 64, 128]
+            }
+
+            # Perform random search
+            best_params = random_search(param_grid, n_iter=20)
+
+            # Save the best parameters
+            save_params(best_params, filepath=best_params_filepath)
+
+        # Use best params to define and train final model
+        global EMBED_SIZE, NUM_FILTERS, FILTER_SIZES, DROPOUT_RATE, BATCH_SIZE
+        EMBED_SIZE = best_params['embed_size']
+        NUM_FILTERS = best_params['num_filters']
+        FILTER_SIZES = best_params['filter_sizes']
+        DROPOUT_RATE = best_params['dropout_rate']
+        LEARNING_RATE = best_params['learning_rate']
+        WEIGHT_DECAY = best_params['weight_decay']
+        BATCH_SIZE = best_params['batch_size']
+    else:
+        # Default parameters
+        BATCH_SIZE = 32
+        EMBED_SIZE = 100
+        NUM_CLASSES = 5
+        NUM_FILTERS = 100
+        FILTER_SIZES = [3, 4, 5]
+        DROPOUT_RATE = 0.5
+        LEARNING_RATE = 1e-3
+        WEIGHT_DECAY = 1e-5
+    
+    train_loader = create_data_loader(X_train, y_train_stars, y_train_funny, y_train_useful, y_train_cool, BATCH_SIZE)
+    valid_loader = create_data_loader(X_valid, y_valid_stars, y_valid_funny, y_valid_useful, y_valid_cool, BATCH_SIZE)
+    test_loader = create_data_loader(X_test, y_test_stars, y_test_funny, y_test_useful, y_test_cool, BATCH_SIZE)
+
+    # print("cuda available: ", torch.cuda.is_available())
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model = MultiTaskCNNTextModel(vocab_size=len(vocab), embed_size=EMBED_SIZE, num_classes=NUM_CLASSES, num_filters=NUM_FILTERS, filter_sizes=FILTER_SIZES, dropout_rate=DROPOUT_RATE)
+    model = model.to(device)
+
+    # Load model if it exists, otherwise train and save it
+    if not os.path.exists(best_model_filepath):
+        optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+        scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=3)
+
+        EPOCHS = 20
+        early_stopping = EarlyStopping(patience=5, delta=0.01)
+
+        for epoch in range(EPOCHS):
+            print(f"Epoch {epoch + 1}/{EPOCHS}")
+            print('-' * 10)
+            train_acc, train_class_loss, train_reg_loss = train_epoch(model, train_loader, optimizer, device, scheduler=None)
+            print(f"Train classification loss: {train_class_loss:.4f}, Train regression loss: {train_reg_loss:.4f}, Train accuracy: {train_acc:.4f}")
+
+            (val_acc, val_f1, val_class_loss, val_reg_loss,
+             mse_funny, mse_useful, mse_cool,
+             rmse_funny, rmse_useful, rmse_cool) = eval_model(model, valid_loader, device)
+            
+            print(f"Validation classification loss: {val_class_loss:.4f}, Validation regression loss: {val_reg_loss:.4f}, Validation accuracy: {val_acc:.4f}, Validation F1 score: {val_f1:.4f}")
+            print(f"Validation MSE - Funny: {mse_funny:.4f}, Useful: {mse_useful:.4f}, Cool: {mse_cool:.4f}")
+            print(f"Validation RMSE - Funny: {rmse_funny:.4f}, Useful: {rmse_useful:.4f}, Cool: {rmse_cool:.4f}")
+
+            val_loss = val_class_loss + val_reg_loss
+            scheduler.step(val_loss)
+
+            early_stopping(val_loss, model)
+            if early_stopping.early_stop:
+                print("Early stopping")
+                break
+
+        print("Training complete. Saving the model.")
+        save_model(model, filepath=best_model_filepath)
+    else:
+        model = load_model(model, filepath=best_model_filepath)
+        if model:
+            print("Loaded saved model.")
+
+    # Evaluate the final model on the test set
+    (test_acc, test_f1, test_class_loss, test_reg_loss,
      mse_funny, mse_useful, mse_cool,
      rmse_funny, rmse_useful, rmse_cool) = eval_model(model, test_loader, device)
 
-    print(f"Test classification loss: {test_class_loss:.4f}, Test regression loss: {test_reg_loss:.4f}, Test accuracy: {test_acc:.4f}")
+    print(f"Test classification loss: {test_class_loss:.4f}, Test regression loss: {test_reg_loss:.4f}, Test accuracy: {test_acc:.4f}, Test F1 score: {test_f1:.4f}")
     print(f"Test MSE - Funny: {mse_funny:.4f}, Useful: {mse_useful:.4f}, Cool: {mse_cool:.4f}")
     print(f"Test RMSE - Funny: {rmse_funny:.4f}, Useful: {rmse_useful:.4f}, Cool: {rmse_cool:.4f}")
