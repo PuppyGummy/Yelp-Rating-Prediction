@@ -17,6 +17,7 @@ from nltk.corpus import stopwords
 from torch.optim import lr_scheduler
 from sklearn.metrics import f1_score
 from collections import Counter
+from sklearn.metrics import classification_report
 
 # Constants
 MAX_SEQUENCE_LENGTH = 150
@@ -251,6 +252,7 @@ def eval_model(model, data_loader, device):
 
     classification_accuracy = total_correct / total
     f1 = f1_score(all_labels, all_preds, average='weighted')
+    report = classification_report(all_labels, all_preds)
     avg_classification_loss = total_classification_loss / total
     avg_regression_loss = total_regression_loss / total
     mse_funny /= total
@@ -260,7 +262,7 @@ def eval_model(model, data_loader, device):
     rmse_useful = mse_useful ** 0.5
     rmse_cool = mse_cool ** 0.5
 
-    return (classification_accuracy, f1, avg_classification_loss, avg_regression_loss,
+    return (classification_accuracy, f1, report, avg_classification_loss, avg_regression_loss,
             mse_funny, mse_useful, mse_cool, rmse_funny, rmse_useful, rmse_cool)
 
 class EarlyStopping:
@@ -499,10 +501,10 @@ if __name__ == '__main__':
             print("Loaded saved model.")
 
     # Evaluate the final model on the test set
-    (test_acc, test_f1, test_class_loss, test_reg_loss,
+    (test_acc, test_f1,test_report, test_class_loss, test_reg_loss,
      mse_funny, mse_useful, mse_cool,
      rmse_funny, rmse_useful, rmse_cool) = eval_model(model, test_loader, device)
 
-    print(f"Test classification loss: {test_class_loss:.4f}, Test regression loss: {test_reg_loss:.4f}, Test accuracy: {test_acc:.4f}, Test F1 score: {test_f1:.4f}")
+    print(f"Test classification loss: {test_class_loss:.4f}, Test regression loss: {test_reg_loss:.4f}, Test accuracy: {test_acc:.4f}, Test F1 score: {test_f1:.4f}", "\n", test_report)
     print(f"Test MSE - Funny: {mse_funny:.4f}, Useful: {mse_useful:.4f}, Cool: {mse_cool:.4f}")
     print(f"Test RMSE - Funny: {rmse_funny:.4f}, Useful: {rmse_useful:.4f}, Cool: {rmse_cool:.4f}")
