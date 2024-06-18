@@ -1,0 +1,1 @@
+{"tfidf__max_features": 6585, "tfidf__min_df": 8, "tfidf__ngram_range": [1, 2]}
