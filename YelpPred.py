@@ -2,38 +2,54 @@ import json
 import random
 import pandas as pd
 import re
-import nltk
-from nltk.corpus import stopwords
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support, mean_squared_error
-from transformers import BertTokenizer, BertModel, AdamW, get_linear_schedule_with_warmup
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from imblearn.over_sampling import SMOTE
-import numpy as np
+from sklearn.model_selection import train_test_split
+from torchtext.vocab import Vocab, build_vocab_from_iterator
+from torchtext.data.utils import get_tokenizer
+from transformers import get_linear_schedule_with_warmup
+from tqdm import tqdm
+from nltk.corpus import stopwords
+from torch.optim import lr_scheduler
+from sklearn.metrics import f1_score
+from collections import Counter
+from sklearn.metrics import classification_report
 
-# nltk.download('stopwords')
+# Constants
+MAX_SEQUENCE_LENGTH = 150
+MAX_NUM_WORDS = 10000
+N_SAMPLES = 80000
+NUM_CLASSES = 5
+SAVE_DIR = "./model"
 
-REPLACE_BY_SPACE_RE = re.compile('[/(){}\[\]\|@,;]')
-BAD_SYMBOLS_RE = re.compile('[^0-9a-z #+_]')
-STOPWORDS = set(stopwords.words('english'))
+remove_low_ratings_flag = False
+remove_top_k_words_flag = False
+use_small_subset = True
+fine_tuning = True
+train_model = False
 
+# Clean the text data
 def clean_text(text):
+    REPLACE_BY_SPACE_RE = re.compile(r'[/(){}\[\]\|@,;]')
+    BAD_SYMBOLS_RE = re.compile(r'[^0-9a-z #+_]')
+    STOPWORDS = set(stopwords.words('english'))
+
     text = text.lower()
     text = re.sub(REPLACE_BY_SPACE_RE, ' ', text)
     text = re.sub(BAD_SYMBOLS_RE, '', text)
-    text = ' '.join([word for word in text.split() if word not in STOPWORDS])
+    # text = ' '.join([word for word in text.split() if word not in STOPWORDS])
     return text
 
-def load_data():
+def load_data(n_samples=10000, file_path='yelp_academic_dataset_review.json'):
     random.seed(42)
-    num_lines = sum(1 for l in open('yelp_academic_dataset_review.json'))
-    size = 10000
-    keep_idx = set(random.sample(range(num_lines), size))
+    num_lines = sum(1 for l in open(file_path))
+    keep_idx = set(random.sample(range(num_lines), n_samples))
     data = []
-    with open('yelp_academic_dataset_review.json') as f:
+    with open(file_path) as f:
         for i, line in enumerate(f):
             if i in keep_idx:
                 data.append(json.loads(line))
@@ -42,217 +58,453 @@ def load_data():
     df['text'] = df['text'].apply(clean_text)
     return df
 
-def data_preprocessing():
-    df = load_data()
+def remove_low_ratings(df, low_rating=1):
+    """Remove rows with low star ratings."""
+    return df[df['stars'] != low_rating]
+
+def remove_top_k_words(df, k=10):
+    """Remove the top-K most frequent words from the dataset."""
+    all_words = ' '.join(df['text']).split()
+    most_common_words = [word for word, count in Counter(all_words).most_common(k)]
+    
+    def clean_text(text):
+        return ' '.join([word for word in text.split() if word not in most_common_words])
+    
+    df['text'] = df['text'].apply(clean_text)
+    return df
+
+def data_preprocessing(n_samples):
+    df = load_data(n_samples)
     df['stars'] = df['stars'].astype(int)
 
     # Drop any missing values
     df = df.dropna()
-    
-    X = df['text']
-    y = df[['stars', 'useful', 'funny', 'cool']]
-    
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
-    X_valid, X_test, y_valid, y_test = train_test_split(X_test, y_test, test_size=0.5, random_state=42)
-    
-    # smote = SMOTE(random_state=42)
-    # X_train_res, y_train_res = smote.fit_resample(pd.DataFrame(X_train), y_train[['stars']])
-    
-    # train_data_resampled = pd.concat([X_train_res, y_train[['useful', 'funny', 'cool']].reset_index(drop=True)], axis=1)
-    
-    return X_train, X_valid, X_test, y_train, y_valid, y_test
+
+    if remove_low_ratings_flag:
+        print("Removing low ratings")
+        df = remove_low_ratings(df)
+    if remove_top_k_words_flag:
+        print("Removing top K words")
+        df = remove_top_k_words(df)
+
+    # Prepare the texts and the labels
+    texts = df['text'].values
+    stars = df['stars'].values - 1  # Convert 1-5 to 0-4
+    funny = df['funny'].values
+    useful = df['useful'].values
+    cool = df['cool'].values
+
+    tokenizer = get_tokenizer("basic_english")
+
+    def yield_tokens(data_iter):
+        for text in data_iter:
+            yield tokenizer(text)
+
+    vocab = build_vocab_from_iterator(yield_tokens(df['text']), specials=["<unk>"])
+    vocab.set_default_index(vocab["<unk>"])
+
+    text_pipeline = lambda x: vocab(tokenizer(x))
+    label_pipeline = lambda x: int(x) - 1  # Convert 1-5 to 0-4
+
+    # Split the data
+    X_train_texts, X_temp_texts, y_train_stars, y_temp_stars = train_test_split(texts, stars, test_size=0.4, random_state=42)
+    X_valid_texts, X_test_texts, y_valid_stars, y_test_stars = train_test_split(X_temp_texts, y_temp_stars, test_size=0.5, random_state=42)
+
+    y_train_funny, y_temp_funny = train_test_split(funny, test_size=0.4, random_state=42)
+    y_valid_funny, y_test_funny = train_test_split(y_temp_funny, test_size=0.5, random_state=42)
+
+    y_train_useful, y_temp_useful = train_test_split(useful, test_size=0.4, random_state=42)
+    y_valid_useful, y_test_useful = train_test_split(y_temp_useful, test_size=0.5, random_state=42)
+
+    y_train_cool, y_temp_cool = train_test_split(cool, test_size=0.4, random_state=42)
+    y_valid_cool, y_test_cool = train_test_split(y_temp_cool, test_size=0.5, random_state=42)
+
+    def preprocess_batch(batch_texts, batch_stars, batch_funny, batch_useful, batch_cool):
+        token_ids = [text_pipeline(text) for text in batch_texts]
+        token_ids = [item[:MAX_SEQUENCE_LENGTH] for item in token_ids]
+        token_ids = [pad(item) for item in token_ids]
+        return (
+            torch.tensor(token_ids, dtype=torch.long), 
+            torch.tensor(batch_stars, dtype=torch.long),
+            torch.tensor(batch_funny, dtype=torch.float),
+            torch.tensor(batch_useful, dtype=torch.float),
+            torch.tensor(batch_cool, dtype=torch.float)
+        )
+
+    def pad(sequence):
+        return sequence + [0] * (MAX_SEQUENCE_LENGTH - len(sequence))
+
+    X_train, y_train_stars, y_train_funny, y_train_useful, y_train_cool = preprocess_batch(X_train_texts, y_train_stars, y_train_funny, y_train_useful, y_train_cool)
+    X_valid, y_valid_stars, y_valid_funny, y_valid_useful, y_valid_cool = preprocess_batch(X_valid_texts, y_valid_stars, y_valid_funny, y_valid_useful, y_valid_cool)
+    X_test, y_test_stars, y_test_funny, y_test_useful, y_test_cool = preprocess_batch(X_test_texts, y_test_stars, y_test_funny, y_test_useful, y_test_cool)
+
+    return X_train, X_valid, X_test, (y_train_stars, y_train_funny, y_train_useful, y_train_cool), (y_valid_stars, y_valid_funny, y_valid_useful, y_valid_cool), (y_test_stars, y_test_funny, y_test_useful, y_test_cool), vocab
 
 class YelpReviewDataset(Dataset):
-    def __init__(self, texts, targets, tokenizer, max_len):
+    def __init__(self, texts, stars, funny, useful, cool):
         self.texts = texts
-        self.targets = targets
-        self.tokenizer = tokenizer
-        self.max_len = max_len
+        self.stars = stars
+        self.funny = funny
+        self.useful = useful
+        self.cool = cool
 
     def __len__(self):
         return len(self.texts)
 
     def __getitem__(self, idx):
-        text = self.texts.iloc[idx]
-        targets = self.targets.iloc[idx]
-        encoding = self.tokenizer.encode_plus(
-            text,
-            add_special_tokens=True,
-            max_length=self.max_len,
-            padding='max_length',
-            truncation=True,
-            return_attention_mask=True,
-            return_tensors='pt',
-        )
-        return {
-            'text': text,
-            'input_ids': encoding['input_ids'].flatten(),
-            'attention_mask': encoding['attention_mask'].flatten(),
-            'stars': torch.tensor(targets['stars'], dtype=torch.long),
-            'regression_targets': torch.tensor(targets[['useful', 'funny', 'cool']].values, dtype=torch.float)
-        }
+        return self.texts[idx], self.stars[idx], self.funny[idx], self.useful[idx], self.cool[idx]
 
-def create_data_loader(df, tokenizer, max_len, batch_size):
-    ds = YelpReviewDataset(
-        texts=df['text'],
-        targets=df[['stars', 'useful', 'funny', 'cool']],
-        tokenizer=tokenizer,
-        max_len=max_len
-    )
-    return DataLoader(
-        ds,
-        batch_size=batch_size,
-        num_workers=4
-    )
+def create_data_loader(texts, stars, funny, useful, cool, batch_size):
+    dataset = YelpReviewDataset(texts, stars, funny, useful, cool)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-class BERTMultiTaskModel(nn.Module):
-    def __init__(self, n_classes):
-        super(BERTMultiTaskModel, self).__init__()
-        self.bert = BertModel.from_pretrained('bert-base-uncased')
-        self.dropout = nn.Dropout(p=0.3)
-        self.classifier = nn.Linear(self.bert.config.hidden_size, n_classes)
-        self.regressor = nn.Linear(self.bert.config.hidden_size, 3)
-    
-    def forward(self, input_ids, attention_mask):
-        bert_outputs = self.bert(
-            input_ids=input_ids,
-            attention_mask=attention_mask
-        )
-        pooled_output = bert_outputs.pooler_output
-        pooled_output = self.dropout(pooled_output)
-        classification_logits = self.classifier(pooled_output)
-        regression_outputs = self.regressor(pooled_output)
+class MultiTaskCNNTextModel(nn.Module):
+    def __init__(self, vocab_size, embed_size, num_classes, num_filters, filter_sizes, dropout_rate):
+        super(MultiTaskCNNTextModel, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_size)
+        self.convs = nn.ModuleList([nn.Conv2d(1, num_filters, (fs, embed_size)) for fs in filter_sizes])
+        self.batch_norms = nn.ModuleList([nn.BatchNorm2d(num_filters) for _ in filter_sizes])
+        self.dropout = nn.Dropout(dropout_rate)  # Updated line to accept dropout rate
+        self.classifier = nn.Linear(len(filter_sizes) * num_filters, num_classes)
+        self.regressor = nn.Linear(len(filter_sizes) * num_filters, 3)  # 3 regression targets: funny, useful, cool
+
+    def forward(self, x):
+        x = self.embedding(x).unsqueeze(1)  # Add a channel dimension: (batch_size, 1, sequence_length, embed_size)
+        x = [self.batch_norms[i](F.relu(conv(x))).squeeze(3) for i, conv in enumerate(self.convs)]
+        x = [F.max_pool1d(item, item.size(2)).squeeze(2) for item in x]
+        x = torch.cat(x, 1)
+        x = self.dropout(x)
+        classification_logits = self.classifier(x)
+        regression_outputs = self.regressor(x)
         return classification_logits, regression_outputs
 
-def train_epoch(model, data_loader, classification_loss_fn, regression_loss_fn, optimizer, device, scheduler):
+def train_epoch(model, data_loader, optimizer, device, scheduler=None):
     model.train()
     total_classification_loss = 0
     total_regression_loss = 0
-    for d in data_loader:
-        input_ids = d['input_ids'].to(device)
-        attention_mask = d['attention_mask'].to(device)
-        stars = d['stars'].to(device)
-        regression_targets = d['regression_targets'].to(device)
-        classification_logits, regression_outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-        classification_loss = classification_loss_fn(classification_logits, stars)
-        regression_loss = regression_loss_fn(regression_outputs, regression_targets)
-        loss = classification_loss + regression_loss
-        total_classification_loss += classification_loss.item()
-        total_regression_loss += regression_loss.item()
+    total_correct = 0
+    total = 0
+
+    for texts, stars, funny, useful, cool in tqdm(data_loader, desc="Training"):
+        texts = texts.to(device)
+        stars = stars.to(device)
+        funny = funny.to(device)
+        useful = useful.to(device)
+        cool = cool.to(device)
+
         optimizer.zero_grad()
+        classification_logits, regression_outputs = model(texts)
+        classification_loss = F.cross_entropy(classification_logits, stars)
+        regression_loss = F.mse_loss(regression_outputs[:, 0], funny) + \
+                          F.mse_loss(regression_outputs[:, 1], useful) + \
+                          F.mse_loss(regression_outputs[:, 2], cool)
+        
+        loss = classification_loss + regression_loss
         loss.backward()
         optimizer.step()
-        scheduler.step()
-    return total_classification_loss / len(data_loader), total_regression_loss / len(data_loader)
+        if scheduler:
+            scheduler.step()
 
-def eval_model(model, data_loader, classification_loss_fn, regression_loss_fn, device):
+        total_classification_loss += classification_loss.item() * texts.size(0)
+        total_regression_loss += regression_loss.item() * texts.size(0)
+        total_correct += (classification_logits.argmax(1) == stars).sum().item()
+        total += stars.size(0)
+
+    return total_correct / total, total_classification_loss / total, total_regression_loss / total
+
+def eval_model(model, data_loader, device):
     model.eval()
     total_classification_loss = 0
     total_regression_loss = 0
+    total_correct = 0
+    total = 0
+    all_preds = []
+    all_labels = []
+    mse_funny, mse_useful, mse_cool = 0, 0, 0
+
     with torch.no_grad():
-        for d in data_loader:
-            input_ids = d['input_ids'].to(device)
-            attention_mask = d['attention_mask'].to(device)
-            stars = d['stars'].to(device)
-            regression_targets = d['regression_targets'].to(device)
-            classification_logits, regression_outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            classification_loss = classification_loss_fn(classification_logits, stars)
-            regression_loss = regression_loss_fn(regression_outputs, regression_targets)
-            total_classification_loss += classification_loss.item()
-            total_regression_loss += regression_loss.item()
-    return total_classification_loss / len(data_loader), total_regression_loss / len(data_loader)
+        for texts, stars, funny, useful, cool in tqdm(data_loader, desc="Evaluating"):
+            texts = texts.to(device)
+            stars = stars.to(device)
+            funny = funny.to(device)
+            useful = useful.to(device)
+            cool = cool.to(device)
 
-def predict(model, data_loader, device):
-    model = model.eval()
-    reviews = []
-    stars = []
-    regression_outputs = []
-    predictions = []
-    regression_predictions = []
-    with torch.no_grad():
-        for d in data_loader:
-            input_ids = d['input_ids'].to(device)
-            attention_mask = d['attention_mask'].to(device)
-            stars_batch = d['stars'].to(device)
-            regression_targets_batch = d['regression_targets'].to(device)
-            classification_logits, regression_output = model(input_ids=input_ids, attention_mask=attention_mask)
-            _, preds = torch.max(classification_logits, dim=1)
-            reviews.extend(d['text'])
-            stars.extend(stars_batch.cpu().numpy())
-            regression_outputs.extend(regression_output.cpu().numpy())
-            predictions.extend(preds.cpu().numpy())
-            regression_predictions.extend(regression_output.cpu().numpy())
-    return reviews, stars, regression_outputs, predictions, regression_predictions
+            classification_logits, regression_outputs = model(texts)
+            classification_loss = F.cross_entropy(classification_logits, stars)
+            regression_loss_funny = F.mse_loss(regression_outputs[:, 0], funny)
+            regression_loss_useful = F.mse_loss(regression_outputs[:, 1], useful)
+            regression_loss_cool = F.mse_loss(regression_outputs[:, 2], cool)
 
-if __name__ == '__main__':
-    X_train, X_valid, X_test, y_train, y_valid, y_test = data_preprocessing()
+            regression_loss = regression_loss_funny + regression_loss_useful + regression_loss_cool
 
-    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-    MAX_LEN = 160
-    BATCH_SIZE = 16
+            total_classification_loss += classification_loss.item() * texts.size(0)
+            total_regression_loss += regression_loss.item() * texts.size(0)
+            total_correct += (classification_logits.argmax(1) == stars).sum().item()
+            total += stars.size(0)
 
-    # 将数据框合并以创建数据加载器
-    train_data = pd.concat([X_train, y_train], axis=1)
-    val_data = pd.concat([X_valid, y_valid], axis=1)
-    test_data = pd.concat([X_test, y_test], axis=1)
+            all_preds.extend(classification_logits.argmax(1).cpu().numpy())
+            all_labels.extend(stars.cpu().numpy())
 
-    train_data_loader = create_data_loader(train_data, tokenizer, MAX_LEN, BATCH_SIZE)
-    val_data_loader = create_data_loader(val_data, tokenizer, MAX_LEN, BATCH_SIZE)
-    test_data_loader = create_data_loader(test_data, tokenizer, MAX_LEN, BATCH_SIZE)
+            mse_funny += regression_loss_funny.item() * texts.size(0)
+            mse_useful += regression_loss_useful.item() * texts.size(0)
+            mse_cool += regression_loss_cool.item() * texts.size(0)
 
-    model = BERTMultiTaskModel(n_classes=5)
+    classification_accuracy = total_correct / total
+    f1 = f1_score(all_labels, all_preds, average='weighted')
+    report = classification_report(all_labels, all_preds)
+    avg_classification_loss = total_classification_loss / total
+    avg_regression_loss = total_regression_loss / total
+    mse_funny /= total
+    mse_useful /= total
+    mse_cool /= total
+    rmse_funny = mse_funny ** 0.5
+    rmse_useful = mse_useful ** 0.5
+    rmse_cool = mse_cool ** 0.5
+
+    return (classification_accuracy, f1, report, avg_classification_loss, avg_regression_loss,
+            mse_funny, mse_useful, mse_cool, rmse_funny, rmse_useful, rmse_cool)
+
+class EarlyStopping:
+    def __init__(self, patience=5, delta=0):
+        self.patience = patience
+        self.delta = delta
+        self.best_score = None
+        self.early_stop = False
+        self.counter = 0
+
+    def __call__(self, val_loss, model):
+        score = -val_loss
+        if self.best_score is None:
+            self.best_score = score
+            self.save_checkpoint(model)
+        elif score < self.best_score + self.delta:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.save_checkpoint(model)
+            self.counter = 0
+
+    def save_checkpoint(self, model):
+        torch.save(model.state_dict(), 'checkpoint.pt')
+
+early_stopping = EarlyStopping(patience=5, delta=0.01)
+
+def random_search(params, n_iter=10):
+    """Random search for hyperparameter tuning."""
+    keys = list(params.keys())
+    best_score = None
+    best_params = None
+    
+    for _ in range(n_iter):
+        # Randomly sample a configuration
+        current_params = {k: random.choice(v) for k, v in params.items()}
+        print(f"Trying configuration: {current_params}")
+
+        # Train and evaluate the model with the current configuration
+        val_score = train_and_evaluate(current_params, use_small_subset=use_small_subset)
+
+        if best_score is None or val_score < best_score:  # Want to minimize loss
+            best_score = val_score
+            best_params = current_params
+
+    print(f"Best configuration: {best_params}")
+    print(f"Best validation score: {best_score}")
+    return best_params
+
+def train_and_evaluate(params, use_small_subset=False):
+    """Train and evaluate the model with the given parameters, optionally using a small subset for speed."""
+    global EMBED_SIZE, NUM_FILTERS, FILTER_SIZES, DROPOUT_RATE, BATCH_SIZE
+    EMBED_SIZE = params['embed_size']
+    NUM_FILTERS = params['num_filters']
+    FILTER_SIZES = params['filter_sizes']
+    DROPOUT_RATE = params['dropout_rate']
+    LEARNING_RATE = params['learning_rate']
+    WEIGHT_DECAY = params['weight_decay']
+    BATCH_SIZE = params['batch_size']
+    
+    # print("train_and_evaluate: use_small_subset: ", use_small_subset)
+    if use_small_subset:
+        X_train, X_valid, _, y_train, y_valid, _, vocab = data_preprocessing(5000)
+    else:
+        X_train, X_valid, X_test, y_train, y_valid, y_test, vocab = data_preprocessing(N_SAMPLES)
+    
+    train_loader = create_data_loader(X_train, y_train_stars, y_train_funny, y_train_useful, y_train_cool, BATCH_SIZE)
+    valid_loader = create_data_loader(X_valid, y_valid_stars, y_valid_funny, y_valid_useful, y_valid_cool, BATCH_SIZE)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model = MultiTaskCNNTextModel(vocab_size=len(vocab), embed_size=EMBED_SIZE, num_classes=NUM_CLASSES,
+                                  num_filters=NUM_FILTERS, filter_sizes=FILTER_SIZES, dropout_rate=DROPOUT_RATE)
     model = model.to(device)
 
-    EPOCHS = 10
-    optimizer = AdamW(model.parameters(), lr=2e-5, correct_bias=False)
-    total_steps = len(train_data_loader) * EPOCHS
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=0,
-        num_training_steps=total_steps
-    )
-    classification_loss_fn = nn.CrossEntropyLoss().to(device)
-    regression_loss_fn = nn.MSELoss().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=3)
+
+    EPOCHS = 5 if use_small_subset else 20  # Use fewer epochs for small subset
+    early_stopping = EarlyStopping(patience=5, delta=0.01)
+
+    best_val_loss = float('inf')
 
     for epoch in range(EPOCHS):
-        train_classification_loss, train_regression_loss = train_epoch(
-            model,
-            train_data_loader,
-            classification_loss_fn,
-            regression_loss_fn,
-            optimizer,
-            device,
-            scheduler
-        )
-        val_classification_loss, val_regression_loss = eval_model(
-            model,
-            val_data_loader,
-            classification_loss_fn,
-            regression_loss_fn,
-            device
-        )
-        print(f'Epoch {epoch + 1}/{EPOCHS}')
-        print(f'Train classification loss: {train_classification_loss}, Train regression loss: {train_regression_loss}')
-        print(f'Validation classification loss: {val_classification_loss}, Validation regression loss: {val_regression_loss}')
+        print(f"Epoch {epoch + 1}/{EPOCHS}")
+        print('-' * 10)
+        train_acc, train_class_loss, train_reg_loss = train_epoch(model, train_loader, optimizer, device, scheduler=None)
+        print(f"Train classification loss: {train_class_loss:.4f}, Train regression loss: {train_reg_loss:.4f}, Train accuracy: {train_acc:.4f}")
 
-    reviews, true_stars, true_regression, pred_stars, pred_regression = predict(model, test_data_loader, device)
+        (val_acc, val_f1, val_class_loss, val_reg_loss,
+            mse_funny, mse_useful, mse_cool,
+            rmse_funny, rmse_useful, rmse_cool) = eval_model(model, valid_loader, device)
+        
+        print(f"Validation classification loss: {val_class_loss:.4f}, Validation regression loss: {val_reg_loss:.4f}, Validation accuracy: {val_acc:.4f}, Validation F1 score: {val_f1:.4f}")
+        print(f"Validation MSE - Funny: {mse_funny:.4f}, Useful: {mse_useful:.4f}, Cool: {mse_cool:.4f}")
+        print(f"Validation RMSE - Funny: {rmse_funny:.4f}, Useful: {rmse_useful:.4f}, Cool: {rmse_cool:.4f}")
 
-    accuracy = accuracy_score(true_stars, pred_stars)
-    precision, recall, f1, _ = precision_recall_fscore_support(true_stars, pred_stars, average='weighted')
+        val_loss = val_class_loss + val_reg_loss
+        scheduler.step(val_loss)
 
-    print(f'Classification Task:')
-    print(f'Accuracy: {accuracy}')
-    print(f'Precision: {precision}')
-    print(f'Recall: {recall}')
-    print(f'F1 Score: {f1}')
+        early_stopping(val_loss, model)
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
 
-    true_regression = np.array(true_regression)
-    pred_regression = np.array(pred_regression)
+        if early_stopping.early_stop:
+            print("Early stopping")
+            break
 
-    mse = mean_squared_error(true_regression, pred_regression)
-    rmse = np.sqrt(mse)
+    return best_val_loss  # Return validation score for model selection
 
-    print(f'Regression Task:')
-    print(f'MSE: {mse}')
-    print(f'RMSE: {rmse}')
+def save_params(params, filepath="best_params.json"):
+    """Save parameters to a JSON file."""
+    with open(filepath, 'w') as f:
+        json.dump(params, f)
+
+def save_model(model, filepath="best_model.pth"):
+    """Save the model state to a file."""
+    torch.save(model.state_dict(), filepath)
+
+
+def load_params(filepath="best_params.json"):
+    """Load parameters from a JSON file, if it exists."""
+    if os.path.exists(filepath):
+        with open(filepath, 'r') as f:
+            params = json.load(f)
+        return params
+    return None
+
+def load_model(model, filepath="best_model.pth"):
+    """Load the model state from a file, if it exists."""
+    if os.path.exists(filepath):
+        model.load_state_dict(torch.load(filepath))
+        return model
+    return None
+
+if __name__ == '__main__':
+    best_params_filepath = "best_params.json"
+    best_model_filepath = "best_model.pth"
+
+    # Load best parameters or perform random search
+    best_params = load_params(filepath=best_params_filepath)
+
+    # Prepare data loaders
+    X_train, X_valid, X_test, y_train, y_valid, y_test, vocab = data_preprocessing(N_SAMPLES)
+    y_train_stars, y_train_funny, y_train_useful, y_train_cool = y_train
+    y_valid_stars, y_valid_funny, y_valid_useful, y_valid_cool = y_valid
+    y_test_stars, y_test_funny, y_test_useful, y_test_cool = y_test
+
+    print("Fine tuning: ", fine_tuning)
+    if fine_tuning:
+        if best_params is None:
+            # Define the parameter grid for random search
+            param_grid = {
+                "embed_size": [50, 100, 200],
+                "num_filters": [50, 100, 150],
+                "filter_sizes": [[3, 4, 5], [2, 3, 4, 5], [3, 5, 7]],
+                "dropout_rate": [0.3, 0.5, 0.7],
+                "learning_rate": [1e-3, 1e-4, 1e-5],
+                "weight_decay": [1e-5, 1e-6, 1e-7],
+                "batch_size": [32, 64, 128]
+            }
+
+            # Perform random search
+            best_params = random_search(param_grid, n_iter=10)
+
+            # Save the best parameters
+            save_params(best_params, filepath=best_params_filepath)
+
+        # Use best params to define and train final model
+        global EMBED_SIZE, NUM_FILTERS, FILTER_SIZES, DROPOUT_RATE, BATCH_SIZE
+        EMBED_SIZE = best_params['embed_size']
+        NUM_FILTERS = best_params['num_filters']
+        FILTER_SIZES = best_params['filter_sizes']
+        DROPOUT_RATE = best_params['dropout_rate']
+        LEARNING_RATE = best_params['learning_rate']
+        WEIGHT_DECAY = best_params['weight_decay']
+        BATCH_SIZE = best_params['batch_size']
+    else:
+        # Default parameters
+        BATCH_SIZE = 32
+        EMBED_SIZE = 100
+        NUM_CLASSES = 5
+        NUM_FILTERS = 100
+        FILTER_SIZES = [3, 4, 5]
+        DROPOUT_RATE = 0.5
+        LEARNING_RATE = 1e-3
+        WEIGHT_DECAY = 1e-5
+    
+    train_loader = create_data_loader(X_train, y_train_stars, y_train_funny, y_train_useful, y_train_cool, BATCH_SIZE)
+    valid_loader = create_data_loader(X_valid, y_valid_stars, y_valid_funny, y_valid_useful, y_valid_cool, BATCH_SIZE)
+    test_loader = create_data_loader(X_test, y_test_stars, y_test_funny, y_test_useful, y_test_cool, BATCH_SIZE)
+
+    # print("cuda available: ", torch.cuda.is_available())
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model = MultiTaskCNNTextModel(vocab_size=len(vocab), embed_size=EMBED_SIZE, num_classes=NUM_CLASSES, num_filters=NUM_FILTERS, filter_sizes=FILTER_SIZES, dropout_rate=DROPOUT_RATE)
+    model = model.to(device)
+
+    # Load model if it exists, otherwise train and save it
+    if not os.path.exists(best_model_filepath) or train_model:
+        optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+        scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=3)
+
+        EPOCHS = 20
+        early_stopping = EarlyStopping(patience=5, delta=0.01)
+
+        for epoch in range(EPOCHS):
+            print(f"Epoch {epoch + 1}/{EPOCHS}")
+            print('-' * 10)
+            train_acc, train_class_loss, train_reg_loss = train_epoch(model, train_loader, optimizer, device, scheduler=None)
+            print(f"Train classification loss: {train_class_loss:.4f}, Train regression loss: {train_reg_loss:.4f}, Train accuracy: {train_acc:.4f}")
+
+            (val_acc, val_f1, val_class_loss, val_reg_loss,
+             mse_funny, mse_useful, mse_cool,
+             rmse_funny, rmse_useful, rmse_cool) = eval_model(model, valid_loader, device)
+            
+            print(f"Validation classification loss: {val_class_loss:.4f}, Validation regression loss: {val_reg_loss:.4f}, Validation accuracy: {val_acc:.4f}, Validation F1 score: {val_f1:.4f}")
+            print(f"Validation MSE - Funny: {mse_funny:.4f}, Useful: {mse_useful:.4f}, Cool: {mse_cool:.4f}")
+            print(f"Validation RMSE - Funny: {rmse_funny:.4f}, Useful: {rmse_useful:.4f}, Cool: {rmse_cool:.4f}")
+
+            val_loss = val_class_loss + val_reg_loss
+            scheduler.step(val_loss)
+
+            early_stopping(val_loss, model)
+            if early_stopping.early_stop:
+                print("Early stopping")
+                break
+
+        print("Training complete. Saving the model.")
+        save_model(model, filepath=best_model_filepath)
+    else:
+        model = load_model(model, filepath=best_model_filepath)
+        if model:
+            print("Loaded saved model.")
+
+    # Evaluate the final model on the test set
+    (test_acc, test_f1,test_report, test_class_loss, test_reg_loss,
+     mse_funny, mse_useful, mse_cool,
+     rmse_funny, rmse_useful, rmse_cool) = eval_model(model, test_loader, device)
+
+    print(f"Test classification loss: {test_class_loss:.4f}, Test regression loss: {test_reg_loss:.4f}, Test accuracy: {test_acc:.4f}, Test F1 score: {test_f1:.4f}", "\n", test_report)
+    print(f"Test MSE - Funny: {mse_funny:.4f}, Useful: {mse_useful:.4f}, Cool: {mse_cool:.4f}")
+    print(f"Test RMSE - Funny: {rmse_funny:.4f}, Useful: {rmse_useful:.4f}, Cool: {rmse_cool:.4f}")
