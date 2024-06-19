@@ -6,49 +6,36 @@ import nltk
 from nltk.corpus import stopwords
 from sklearn.feature_extraction.text import TfidfVectorizer
 import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, mean_absolute_error, classification_report, mean_squared_error
+from sklearn.model_selection import train_test_split, RandomizedSearchCV
+from sklearn.metrics import accuracy_score, mean_absolute_error, classification_report, mean_squared_error, make_scorer
+from sklearn import preprocessing
 from joblib import dump, load
 import os
-from collections import Counter
-from sklearn import preprocessing
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.pipeline import Pipeline
+from scipy.stats import randint, uniform
 
 N_SAMPLES = 80000
-
 
 class NaiveBayes:
     def __init__(self):
         self.classes = None
-        self.class_word_counts = None
-        self.class_totals = None
-        self.class_priors = None
-        self.vocab = None
-        self.vocab_size = 0
-    
+        self.class_prior = None
+        self.feature_prob = None
+
     def fit(self, X, y):
         self.classes = np.unique(y)
-        self.class_word_counts = {cls: np.zeros(X.shape[1]) for cls in self.classes}
-        self.class_totals = {cls: 0 for cls in self.classes}
-        self.class_priors = {cls: 0 for cls in self.classes}
-        
-        for cls in self.classes:
-            X_cls = X[y == cls]
-            self.class_word_counts[cls] = np.sum(X_cls, axis=0)
-            self.class_totals[cls] = np.sum(self.class_word_counts[cls])
-            self.class_priors[cls] = X_cls.shape[0] / X.shape[0]
-        
-        self.vocab_size = X.shape[1]
-    
+        word_counts = np.array([np.sum(y == class_label) for class_label in self.classes])
+        self.class_prior = np.log(word_counts / len(y))
+
+        feature_counts = np.array([X[y == class_label].sum(axis=0) for class_label in self.classes])
+        feature_counts += 1
+
+        self.feature_prob = np.log(feature_counts / feature_counts.sum(axis=1, keepdims=True))
+
     def predict(self, X):
-        y_pred = []
-        for x in X:
-            class_probs = {}
-            for cls in self.classes:
-                log_prior = np.log(self.class_priors[cls])
-                log_likelihood = np.sum(np.log((self.class_word_counts[cls] + 1) / (self.class_totals[cls] + self.vocab_size)) * x)
-                class_probs[cls] = log_prior + log_likelihood
-            y_pred.append(max(class_probs, key=class_probs.get))
-        return np.array(y_pred)
+        log_probs = X @ self.feature_prob.T + self.class_prior
+        return self.classes[np.argmax(log_probs, axis=1)]
 
 # Clean the text data
 def clean_text(text, additional_stop_words=set()):
@@ -76,21 +63,13 @@ def load_data(n_samples=10000, file_path='../yelp_academic_dataset_review.json')
                 data.append(json.loads(line))
     df = pd.DataFrame(data)
     df = df.drop(['review_id', 'user_id', 'business_id', 'date'], axis=1)
-    
-    # Determine the top k most frequent words to remove
-    k = 20
-    all_words = ' '.join(df['text']).lower().split()
-    most_common_words = set(word for word, count in Counter(all_words).most_common(k))
-    
-    print("Top k most frequent words:")
-    print(most_common_words)
-    # Apply preprocessing with additional stop words
-    df['text'] = df['text'].apply(lambda x: clean_text(x, most_common_words))
-    
+   
+    df['text'] = df['text'].apply(clean_text)
     return df
-    
+
+
 def load_model(feature, X_train_dense, y_train):
-    path = '../Models/naive_bayes_model_topk_'+ feature +'.joblib'
+    path = '../Models/naive_bayes_model_no_norm_'+ feature +'.joblib'
     model = NaiveBayes()
     if os.path.isfile(path):
         model = load(path)
@@ -99,13 +78,61 @@ def load_model(feature, X_train_dense, y_train):
         model.fit(X_train_dense, y_train)
         dump(model, path)
     return model
+ 
+def findBestPara(X_train, y_stars_train):
+    # Create a pipeline with TF-IDF and a dummy classifier (to be replaced with NaiveBayes)
+    pipeline = Pipeline([
+        ('tfidf', TfidfVectorizer()),
+        ('clf', MultinomialNB())
+    ])
     
+    # Define the parameter grid
+    param_dist = {
+        'tfidf__max_features': randint(5000, 20000),
+        'tfidf__ngram_range': [(1, 1), (1, 2)],
+        'tfidf__min_df': randint(1, 10)
+    }
+    
+    # Create a custom scorer
+    scorer = make_scorer(mean_absolute_error, greater_is_better=False)
+
+    # Perform grid search
+    random_search = RandomizedSearchCV(pipeline, param_distributions=param_dist, n_iter=50, cv=3, scoring=scorer, verbose=1, n_jobs=-1, random_state=42)
+    random_search.fit(X_train, y_stars_train)
+
+    # Print the best parameters
+    print("Best parameters found: ", random_search.best_params_)
+    
+    #save to json
+    path = '../best_params_Tfidf.json'
+    with open(path, 'w') as f:
+        json.dump(random_search.best_params_, f)
+        
+    return random_search.best_params_
+
+def load_best_params():
+    path = '../best_params_Tfidf.json'
+    params = None
+    if os.path.isfile(path):
+        with open(path, 'r') as f:
+            params = json.load(f)
+            print('load best parameters for TF-IDF Vectorizer from pre-loaded json file')
+    else:
+        params = findBestPara(X_train, y_stars_train)
+    return params
+
+def tf_idf_vectorizer(X_train, y_stars_train, X_test, X_val):
+    best_params = findBestPara(X_train, y_stars_train)
+    vectorizer = TfidfVectorizer(max_features=best_params['tfidf__max_features'],
+                             ngram_range=best_params['tfidf__ngram_range'],
+                             min_df=best_params['tfidf__min_df'])
+    X_tfidf_train = vectorizer.fit_transform(X_train)
+    X_tfidf_test = vectorizer.transform(X_test)
+    X_tfidf_val = vectorizer.transform(X_val)
+    return X_tfidf_train, X_tfidf_test, X_tfidf_val
 
 def train_split_save_data_tfidf():
     df = load_data(N_SAMPLES)
-    # Drop any missing values
-    df = df.dropna()
-    #df.head()
     
     # Split the data
     X = df['text']
@@ -122,22 +149,16 @@ def train_split_save_data_tfidf():
     X_val, X_test, y_stars_val, y_stars_test, y_useful_val, y_useful_test, y_funny_val, y_funny_test, y_cool_val, y_cool_test = train_test_split(
     X_temp, y_stars_temp, y_useful_temp, y_funny_temp, y_cool_temp, test_size=0.5, random_state=42)
     
-    # Initialize TF-IDF Vectorizer
-    vectorizer = TfidfVectorizer(max_features=5000)
-    X_tfidf_train = vectorizer.fit_transform(X_train)
-    X_tfidf_test = vectorizer.transform(X_test)
-    X_tfidf_val = vectorizer.transform(X_val)
+    # Drop any missing values
+    df = df.dropna()
     
-    # Normalization the data 
-    scaler = preprocessing.MaxAbsScaler()
-    X_scaler = scaler.fit_transform(X_tfidf_train)
-    X_sc_test = scaler.transform(X_tfidf_test)
-    X_sc_val = scaler.transform(X_tfidf_val)
+    # Initialize the TF-IDF Vectorizer with best parameters
+    X_tfidf_train, X_tfidf_test, X_tfidf_val = tf_idf_vectorizer(X_train, y_stars_train, X_test, X_val)
     
     # Convert sparse matrix to dense matrix
-    X_train_dense = X_scaler.toarray()
-    X_val_dense = X_sc_val.toarray()
-    X_test_dense = X_sc_test.toarray()
+    X_train_dense =  X_tfidf_train.toarray()
+    X_val_dense = X_tfidf_val.toarray()
+    X_test_dense = X_tfidf_test.toarray()
     
     # Initialize and train the Naive Bayes model
     nb_model_stars = load_model('stars', X_train_dense, y_stars_train)
@@ -201,7 +222,7 @@ def train_split_save_data_tfidf():
     y_cool_test_pred = nb_model_cool.predict(X_test_dense)
     mae_cool_test = mean_absolute_error(y_cool_test, y_cool_test_pred)
     print(f'Mean Absolute Error for Cool: {mae_cool_test}')
-        
+    
 if __name__ == '__main__':
-
+    
     train_split_save_data_tfidf()

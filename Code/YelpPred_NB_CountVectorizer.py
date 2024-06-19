@@ -17,37 +17,23 @@ N_SAMPLES = 80000
 class NaiveBayes:
     def __init__(self):
         self.classes = None
-        self.class_word_counts = None
-        self.class_totals = None
-        self.class_priors = None
-        self.vocab = None
-        self.vocab_size = 0
-    
+        self.class_prior = None
+        self.feature_prob = None
+
     def fit(self, X, y):
         self.classes = np.unique(y)
-        self.class_word_counts = {cls: np.zeros(X.shape[1]) for cls in self.classes}
-        self.class_totals = {cls: 0 for cls in self.classes}
-        self.class_priors = {cls: 0 for cls in self.classes}
-        
-        for cls in self.classes:
-            X_cls = X[y == cls]
-            self.class_word_counts[cls] = np.sum(X_cls, axis=0)
-            self.class_totals[cls] = np.sum(self.class_word_counts[cls])
-            self.class_priors[cls] = X_cls.shape[0] / X.shape[0]
-        
-        self.vocab_size = X.shape[1]
-    
-    def predict(self, X):
-        y_pred = []
-        for x in X:
-            class_probs = {}
-            for cls in self.classes:
-                log_prior = np.log(self.class_priors[cls])
-                log_likelihood = np.sum(np.log((self.class_word_counts[cls] + 1) / (self.class_totals[cls] + self.vocab_size)) * x)
-                class_probs[cls] = log_prior + log_likelihood
-            y_pred.append(max(class_probs, key=class_probs.get))
-        return np.array(y_pred)
+        word_counts = np.array([np.sum(y == class_label) for class_label in self.classes])
+        self.class_prior = np.log(word_counts / len(y))
 
+        feature_counts = np.array([X[y == class_label].sum(axis=0) for class_label in self.classes])
+        feature_counts += 1
+
+        self.feature_prob = np.log(feature_counts / feature_counts.sum(axis=1, keepdims=True))
+
+    def predict(self, X):
+        log_probs = X @ self.feature_prob.T + self.class_prior
+        return self.classes[np.argmax(log_probs, axis=1)]
+    
 # Clean the text data
 def clean_text(text, additional_stop_words=set()):
     REPLACE_BY_SPACE_RE = re.compile(r'[/(){}\[\]\|@,;]')
@@ -88,7 +74,21 @@ def load_model(feature, X_train_dense, y_train):
         model.fit(X_train_dense, y_train)
         dump(model, path)
     return model
-    
+
+def normalization(X_train, X_test, X_val):
+    scaler = preprocessing.MaxAbsScaler()
+    X_scaler = scaler.fit_transform(X_train)
+    X_sc_test = scaler.transform(X_test)
+    X_sc_val = scaler.transform(X_val)
+    return X_scaler, X_sc_test, X_sc_val
+
+def cv_vectorizer(X_train, X_test, X_val):
+    vectorizer = CountVectorizer(max_features=5000)
+    X_cv_train = vectorizer.fit_transform(X_train)
+    X_cv_test = vectorizer.transform(X_test)
+    X_cv_val = vectorizer.transform(X_val)
+    return X_cv_train, X_cv_test, X_cv_val
+
 def train_split_save_data_cv():
     df = load_data(N_SAMPLES)
     # Drop any missing values
@@ -111,16 +111,10 @@ def train_split_save_data_cv():
     X_temp, y_stars_temp, y_useful_temp, y_funny_temp, y_cool_temp, test_size=0.5, random_state=42)
     
     # Initialize Count Vectorizer
-    vectorizer = CountVectorizer(max_features=5000)
-    X_cv_train = vectorizer.fit_transform(X_train)
-    X_cv_test = vectorizer.transform(X_test)
-    X_cv_val = vectorizer.transform(X_val)
+    X_cv_train, X_cv_test, X_cv_val = cv_vectorizer(X_train, X_test, X_val)
     
     # Normalization the data 
-    scaler = preprocessing.MaxAbsScaler()
-    X_scaler = scaler.fit_transform(X_cv_train)
-    X_sc_test = scaler.transform(X_cv_test)
-    X_sc_val = scaler.transform(X_cv_val)
+    X_scaler, X_sc_test, X_sc_val = normalization(X_cv_train, X_cv_test, X_cv_val)
     
     # Convert sparse matrix to dense matrix
     X_train_dense = X_scaler.toarray()
