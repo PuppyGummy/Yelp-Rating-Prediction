@@ -4,7 +4,7 @@ import random
 import re
 import nltk
 from nltk.corpus import stopwords
-from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
 import numpy as np
 from sklearn.model_selection import train_test_split, RandomizedSearchCV
 from sklearn.metrics import accuracy_score, mean_absolute_error, classification_report, mean_squared_error, make_scorer
@@ -14,12 +14,16 @@ import os
 from sklearn.naive_bayes import MultinomialNB
 from sklearn.pipeline import Pipeline
 from scipy.stats import randint, uniform
+import time
+import pickle 
 
 N_SAMPLES = 80000
 
+    
 class NaiveBayes:
-    def __init__(self):
+    def __init__(self, alpha=1.0):
         self.classes = None
+        self.alpha = alpha
         self.class_prior = None
         self.feature_prob = None
 
@@ -29,7 +33,7 @@ class NaiveBayes:
         self.class_prior = np.log(word_counts / len(y))
 
         feature_counts = np.array([X[y == class_label].sum(axis=0) for class_label in self.classes])
-        feature_counts += 1
+        feature_counts += self.alpha
 
         self.feature_prob = np.log(feature_counts / feature_counts.sum(axis=1, keepdims=True))
 
@@ -37,6 +41,7 @@ class NaiveBayes:
         log_probs = X @ self.feature_prob.T + self.class_prior
         return self.classes[np.argmax(log_probs, axis=1)]
 
+    
 # Clean the text data
 def clean_text(text, additional_stop_words=set()):
     REPLACE_BY_SPACE_RE = re.compile(r'[/(){}\[\]\|@,;]')
@@ -80,7 +85,7 @@ def load_model(feature, X_train_dense, y_train):
     return model
  
 def findBestPara(X_train, y_stars_train):
-    # Create a pipeline with TF-IDF and a dummy classifier (to be replaced with NaiveBayes)
+    # Create a pipeline with TF-IDF and a dummy classifier
     pipeline = Pipeline([
         ('tfidf', TfidfVectorizer()),
         ('clf', MultinomialNB())
@@ -129,16 +134,43 @@ def normalization(X_train, X_test, X_val):
     return X_scaler, X_sc_test, X_sc_val
 
 def tf_idf_vectorizer(X_train, y_stars_train, X_test, X_val):
-    best_params = findBestPara(X_train, y_stars_train)
-    vectorizer = TfidfVectorizer(max_features=best_params['tfidf__max_features'],
-                             ngram_range=best_params['tfidf__ngram_range'],
-                             min_df=best_params['tfidf__min_df'])
+    path = '../tf-idf.plk'
+    vectorizer = None
+    if os.path.isfile(path):
+        vectorizer = pickle.load(open(path, "rb"))
+        print('load pre-implemented tfidf.')
+    else:
+        best_params = findBestPara(X_train, y_stars_train)
+        vectorizer = TfidfVectorizer(max_features=best_params['tfidf__max_features'],
+                         ngram_range=best_params['tfidf__ngram_range'],
+                         min_df=best_params['tfidf__min_df'])
+        pickle.dump(vectorizer, open(path, "wb"))
+        
     X_tfidf_train = vectorizer.fit_transform(X_train)
     X_tfidf_test = vectorizer.transform(X_test)
-    X_tfidf_val = vectorizer.transform(X_val)
+    X_tfidf_val = vectorizer.transform(X_val)     
     return X_tfidf_train, X_tfidf_test, X_tfidf_val
 
-def train_split_save_data_tfidf():
+def train_and_evaluate_model(X_train, y_train, X_val, y_val, X_test, y_test, target_name):
+    model = load_model(target_name, X_train, y_train)
+   
+    y_val_pred = model.predict(X_val)
+    y_test_pred = model.predict(X_test)
+    if target_name == 'stars':
+        accuracy_stars = accuracy_score(y_test, y_test_pred)
+        report_stars = classification_report(y_test, y_test_pred)
+        print(f'Accuracy for Stars: {accuracy_stars}')
+        print(f'Report for Naive Bayes of Stars:\n {report_stars}')
+    
+    mse_test = mean_squared_error(y_test, y_test_pred)
+    mae_test = mean_absolute_error(y_test, y_test_pred)
+    rmse_test = mean_squared_error(y_test, y_test_pred, squared=False)
+    print(f'{target_name} on Test Set the Mean Squared Error is: {mse_test}, Mean Absolute Error is: {mae_test}, Root Mean Squared Error is: {rmse_test}\n')
+    
+    
+def split_save_data():
+    start = time.time()
+    
     df = load_data(N_SAMPLES)
     
     # Split the data
@@ -170,69 +202,22 @@ def train_split_save_data_tfidf():
     X_val_dense = X_sc_val.toarray()
     X_test_dense = X_sc_test.toarray()
     
-    # Initialize and train the Naive Bayes model
-    nb_model_stars = load_model('stars', X_train_dense, y_stars_train)
-        
-    # Validate the model
-    y_stars_val_pred = nb_model_stars.predict(X_val_dense)
-    mae_stars_val = mean_absolute_error(y_stars_val, y_stars_val_pred)
-    print(f'Mean Absolute Error for Stars on Validation Set: {mae_stars_val}')
+    train_and_evaluate_model(X_train_dense, y_stars_train, X_val_dense, y_stars_val, X_test_dense, y_stars_test, 'stars')
     
-    # Predict on the test set
-    y_stars_test_pred = nb_model_stars.predict(X_test_dense)
+    # Train and evaluate for 'useful'
+    train_and_evaluate_model(X_train_dense, y_useful_train, X_val_dense, y_useful_val, X_test_dense, y_useful_test, 'useful')
 
-    # Evaluate the model
-    accuracy_stars = accuracy_score(y_stars_test, y_stars_test_pred)
-    mae_stars_test = mean_absolute_error(y_stars_test, y_stars_test_pred)
-    report = classification_report(y_stars_test, y_stars_test_pred)
-    print(f'Accuracy for Stars: {accuracy_stars}')
-    print(f'Mean Absolute Error for Stars: {mae_stars_test}')
-    print(f'Report for Naive Bayes\n {report}')
-    
-    
-   # Train for 'useful'
-    nb_model_useful = load_model('useful', X_train_dense, y_useful_train)
+    # Train and evaluate for 'funny'
+    train_and_evaluate_model(X_train_dense, y_funny_train, X_val_dense, y_funny_val, X_test_dense, y_funny_test, 'funny')
 
-    # Validate the model
-    y_useful_val_pred = nb_model_useful.predict(X_val_dense)
-    mae_useful_val = mean_absolute_error(y_useful_val, y_useful_val_pred)
-    acc_useful_val = accuracy_score(y_useful_val, y_useful_val_pred)
-    print(f'Mean Absolute Error for Useful on Validation Set: {mae_useful_val}')
+    # Train and evaluate for 'cool'
+    train_and_evaluate_model(X_train_dense, y_cool_train, X_val_dense, y_cool_val, X_test_dense, y_cool_test, 'cool')
 
-    # Predict on the test set
-    y_useful_test_pred = nb_model_useful.predict(X_test_dense)
-    mae_useful_test = mean_absolute_error(y_useful_test, y_useful_test_pred)
-    acc_useful_test = accuracy_score(y_useful_val, y_useful_val_pred)
-    print(f'Mean Absolute Error for Useful: {mae_useful_test}')
+    end = time.time()
+    total_running_time = end - start
+    print(f'Total running time for the main model: {total_running_time}')
 
-    
-    # Train for 'funny'
-    nb_model_funny = load_model('funny', X_train_dense, y_funny_train)
-
-    # Validate the model
-    y_funny_val_pred = nb_model_funny.predict(X_val_dense)
-    mae_funny_val = mean_absolute_error(y_funny_val, y_funny_val_pred)
-    print(f'Mean Absolute Error for Funny on Validation Set: {mae_funny_val}')
-
-    # Predict on the test set
-    y_funny_test_pred = nb_model_funny.predict(X_test_dense)
-    mae_funny_test = mean_absolute_error(y_funny_test, y_funny_test_pred)
-    print(f'Mean Absolute Error for Funny: {mae_funny_test}')
-
-    
-    # Train for 'cool'
-    nb_model_cool = load_model('cool', X_train_dense, y_cool_train)
-
-    # Validate the model
-    y_cool_val_pred = nb_model_cool.predict(X_val_dense)
-    mae_cool_val = mean_absolute_error(y_cool_val, y_cool_val_pred)
-    print(f'Mean Absolute Error for Cool on Validation Set: {mae_cool_val}')
-
-    # Predict on the test set
-    y_cool_test_pred = nb_model_cool.predict(X_test_dense)
-    mae_cool_test = mean_absolute_error(y_cool_test, y_cool_test_pred)
-    print(f'Mean Absolute Error for Cool: {mae_cool_test}')
     
 if __name__ == '__main__':
     
-    train_split_save_data_tfidf()
+    split_save_data()
