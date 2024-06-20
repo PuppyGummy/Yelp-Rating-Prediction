@@ -11,6 +11,7 @@ from sklearn.metrics import accuracy_score, mean_absolute_error, classification_
 from joblib import dump, load
 import os
 from sklearn import preprocessing
+import time
 
 N_SAMPLES = 80000
 
@@ -89,7 +90,23 @@ def cv_vectorizer(X_train, X_test, X_val):
     X_cv_val = vectorizer.transform(X_val)
     return X_cv_train, X_cv_test, X_cv_val
 
-def train_split_save_data_cv():
+def train_and_evaluate_model(X_train, y_train, X_val, y_val, X_test, y_test, target_name):
+    model = load_model(target_name, X_train, y_train)
+    y_val_pred = model.predict(X_val)
+    y_test_pred = model.predict(X_test)
+    if target_name == 'stars':
+        accuracy_stars = accuracy_score(y_test, y_test_pred)
+        report_stars = classification_report(y_test, y_test_pred)
+        print(f'Accuracy for Stars: {accuracy_stars}')
+        print(f'Report for Naive Bayes of Stars:\n {report_stars}')
+    
+    mse_test = mean_squared_error(y_test, y_test_pred)
+    mae_test = mean_absolute_error(y_test, y_test_pred)
+    rmse_test = mean_squared_error(y_test, y_test_pred, squared=False)
+    print(f'{target_name} on Test Set the Mean Squared Error is: {mse_test}, Mean Absolute Error is: {mae_test}, Mean Squared Error is: {rmse_test}\n')
+    
+def split_save_data():
+    start = time.time()
     df = load_data(N_SAMPLES)
     # Drop any missing values
     df = df.dropna()
@@ -121,69 +138,21 @@ def train_split_save_data_cv():
     X_val_dense = X_sc_val.toarray()
     X_test_dense = X_sc_test.toarray()
     
-    # Initialize and train the Naive Bayes model
-    nb_model_stars = load_model('stars', X_train_dense, y_stars_train)
-        
-    # Validate the model
-    y_stars_val_pred = nb_model_stars.predict(X_val_dense)
-    mae_stars_val = mean_absolute_error(y_stars_val, y_stars_val_pred)
-    print(f'Mean Absolute Error for Stars on Validation Set: {mae_stars_val}')
+    train_and_evaluate_model(X_train_dense, y_stars_train, X_val_dense, y_stars_val, X_test_dense, y_stars_test, 'stars')
     
-    # Predict on the test set
-    y_stars_test_pred = nb_model_stars.predict(X_test_dense)
+    # Train and evaluate for 'useful'
+    train_and_evaluate_model(X_train_dense, y_useful_train, X_val_dense, y_useful_val, X_test_dense, y_useful_test, 'useful')
 
-    # Evaluate the model
-    accuracy_stars = accuracy_score(y_stars_test, y_stars_test_pred)
-    mae_stars_test = mean_absolute_error(y_stars_test, y_stars_test_pred)
-    report = classification_report(y_stars_test, y_stars_test_pred)
-    print(f'Accuracy for Stars: {accuracy_stars}')
-    print(f'Mean Absolute Error for Stars: {mae_stars_test}')
-    print(f'Report for Naive Bayes\n {report}')
+    # Train and evaluate for 'funny'
+    train_and_evaluate_model(X_train_dense, y_funny_train, X_val_dense, y_funny_val, X_test_dense, y_funny_test, 'funny')
+
+    # Train and evaluate for 'cool'
+    train_and_evaluate_model(X_train_dense, y_cool_train, X_val_dense, y_cool_val, X_test_dense, y_cool_test, 'cool')
     
-    
-   # Train for 'useful'
-    nb_model_useful = load_model('useful', X_train_dense, y_useful_train)
-
-    # Validate the model
-    y_useful_val_pred = nb_model_useful.predict(X_val_dense)
-    mae_useful_val = mean_absolute_error(y_useful_val, y_useful_val_pred)
-    acc_useful_val = accuracy_score(y_useful_val, y_useful_val_pred)
-    print(f'Mean Absolute Error for Useful on Validation Set: {mae_useful_val}')
-
-    # Predict on the test set
-    y_useful_test_pred = nb_model_useful.predict(X_test_dense)
-    mae_useful_test = mean_absolute_error(y_useful_test, y_useful_test_pred)
-    acc_useful_test = accuracy_score(y_useful_val, y_useful_val_pred)
-    print(f'Mean Absolute Error for Useful: {mae_useful_test}')
-
-    
-    # Train for 'funny'
-    nb_model_funny = load_model('funny', X_train_dense, y_funny_train)
-
-    # Validate the model
-    y_funny_val_pred = nb_model_funny.predict(X_val_dense)
-    mae_funny_val = mean_absolute_error(y_funny_val, y_funny_val_pred)
-    print(f'Mean Absolute Error for Funny on Validation Set: {mae_funny_val}')
-
-    # Predict on the test set
-    y_funny_test_pred = nb_model_funny.predict(X_test_dense)
-    mae_funny_test = mean_absolute_error(y_funny_test, y_funny_test_pred)
-    print(f'Mean Absolute Error for Funny: {mae_funny_test}')
-
-    
-    # Train for 'cool'
-    nb_model_cool = load_model('cool', X_train_dense, y_cool_train)
-
-    # Validate the model
-    y_cool_val_pred = nb_model_cool.predict(X_val_dense)
-    mae_cool_val = mean_absolute_error(y_cool_val, y_cool_val_pred)
-    print(f'Mean Absolute Error for Cool on Validation Set: {mae_cool_val}')
-
-    # Predict on the test set
-    y_cool_test_pred = nb_model_cool.predict(X_test_dense)
-    mae_cool_test = mean_absolute_error(y_cool_test, y_cool_test_pred)
-    print(f'Mean Absolute Error for Cool: {mae_cool_test}')
+    end = time.time()
+    total_running_time = end - start
+    print(f'Total running time for the original model: {total_running_time}')
     
 if __name__ == '__main__':
 
-    train_split_save_data_cv()
+    split_save_data()
