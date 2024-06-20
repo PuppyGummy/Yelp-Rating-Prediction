@@ -3,6 +3,8 @@ import random
 import pandas as pd
 import re
 import os
+import time
+import sys
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -25,12 +27,6 @@ MAX_NUM_WORDS = 10000
 N_SAMPLES = 80000
 NUM_CLASSES = 5
 SAVE_DIR = "./model"
-
-remove_low_ratings_flag = False
-remove_top_k_words_flag = False
-use_small_subset = True
-fine_tuning = True
-train_model = False
 
 # Clean the text data
 def clean_text(text):
@@ -58,42 +54,49 @@ def load_data(n_samples=10000, file_path='yelp_academic_dataset_review.json'):
     df['text'] = df['text'].apply(clean_text)
     return df
 
-def remove_low_ratings(df, low_rating=1):
-    """Remove rows with low star ratings."""
-    return df[df['stars'] != low_rating]
-
-def remove_top_k_words(df, k=10):
-    """Remove the top-K most frequent words from the dataset."""
-    all_words = ' '.join(df['text']).split()
+# Function to remove top-k most frequent words from a specific dataset
+def remove_top_k_words_from_texts(texts, k=10):
+    all_words = ' '.join(texts).split()
     most_common_words = [word for word, count in Counter(all_words).most_common(k)]
     
     def clean_text(text):
         return ' '.join([word for word in text.split() if word not in most_common_words])
     
-    df['text'] = df['text'].apply(clean_text)
-    return df
+    cleaned_texts = [clean_text(text) for text in texts]
+    return cleaned_texts
 
-def data_preprocessing(n_samples):
+def data_preprocessing(n_samples, remove_low_ratings_flag=False, remove_top_k_words_flag=False):
     df = load_data(n_samples)
     df['stars'] = df['stars'].astype(int)
 
     # Drop any missing values
     df = df.dropna()
+    df['stars'] -= 1  # Convert 1-5 to 0-4
 
+    # Split the data first
+    X_train_texts, X_temp_texts, y_train_stars, y_temp_stars = train_test_split(df['text'].values, df['stars'].values, test_size=0.4, random_state=42)
+    X_valid_texts, X_test_texts, y_valid_stars, y_test_stars = train_test_split(X_temp_texts, y_temp_stars, test_size=0.5, random_state=42)
+
+    # Further split for regression targets
+    y_train_funny, y_temp_funny = train_test_split(df['funny'].values, test_size=0.4, random_state=42)
+    y_valid_funny, y_test_funny = train_test_split(y_temp_funny, test_size=0.5, random_state=42)
+
+    y_train_useful, y_temp_useful = train_test_split(df['useful'].values, test_size=0.4, random_state=42)
+    y_valid_useful, y_test_useful = train_test_split(y_temp_useful, test_size=0.5, random_state=42)
+
+    y_train_cool, y_temp_cool = train_test_split(df['cool'].values, test_size=0.4, random_state=42)
+    y_valid_cool, y_test_cool = train_test_split(y_temp_cool, test_size=0.5, random_state=42)
+
+    # Remove low ratings from y_train
     if remove_low_ratings_flag:
-        print("Removing low ratings")
-        df = remove_low_ratings(df)
+        mask = y_train_stars != 0  # 0 corresponds to 1-star rating after subtraction
+        y_train_stars = y_train_stars[mask]
+
+    # Remove top K most common words from X_train
     if remove_top_k_words_flag:
-        print("Removing top K words")
-        df = remove_top_k_words(df)
+        X_train_texts = remove_top_k_words_from_texts(X_train_texts, k=10)
 
     # Prepare the texts and the labels
-    texts = df['text'].values
-    stars = df['stars'].values - 1  # Convert 1-5 to 0-4
-    funny = df['funny'].values
-    useful = df['useful'].values
-    cool = df['cool'].values
-
     tokenizer = get_tokenizer("basic_english")
 
     def yield_tokens(data_iter):
@@ -104,20 +107,6 @@ def data_preprocessing(n_samples):
     vocab.set_default_index(vocab["<unk>"])
 
     text_pipeline = lambda x: vocab(tokenizer(x))
-    label_pipeline = lambda x: int(x) - 1  # Convert 1-5 to 0-4
-
-    # Split the data
-    X_train_texts, X_temp_texts, y_train_stars, y_temp_stars = train_test_split(texts, stars, test_size=0.4, random_state=42)
-    X_valid_texts, X_test_texts, y_valid_stars, y_test_stars = train_test_split(X_temp_texts, y_temp_stars, test_size=0.5, random_state=42)
-
-    y_train_funny, y_temp_funny = train_test_split(funny, test_size=0.4, random_state=42)
-    y_valid_funny, y_test_funny = train_test_split(y_temp_funny, test_size=0.5, random_state=42)
-
-    y_train_useful, y_temp_useful = train_test_split(useful, test_size=0.4, random_state=42)
-    y_valid_useful, y_test_useful = train_test_split(y_temp_useful, test_size=0.5, random_state=42)
-
-    y_train_cool, y_temp_cool = train_test_split(cool, test_size=0.4, random_state=42)
-    y_valid_cool, y_test_cool = train_test_split(y_temp_cool, test_size=0.5, random_state=42)
 
     def preprocess_batch(batch_texts, batch_stars, batch_funny, batch_useful, batch_cool):
         token_ids = [text_pipeline(text) for text in batch_texts]
@@ -134,11 +123,15 @@ def data_preprocessing(n_samples):
     def pad(sequence):
         return sequence + [0] * (MAX_SEQUENCE_LENGTH - len(sequence))
 
-    X_train, y_train_stars, y_train_funny, y_train_useful, y_train_cool = preprocess_batch(X_train_texts, y_train_stars, y_train_funny, y_train_useful, y_train_cool)
-    X_valid, y_valid_stars, y_valid_funny, y_valid_useful, y_valid_cool = preprocess_batch(X_valid_texts, y_valid_stars, y_valid_funny, y_valid_useful, y_valid_cool)
-    X_test, y_test_stars, y_test_funny, y_test_useful, y_test_cool = preprocess_batch(X_test_texts, y_test_stars, y_test_funny, y_test_useful, y_test_cool)
+    X_train, y_train_stars, y_train_funny, y_train_useful, y_train_cool = preprocess_batch(
+        X_train_texts, y_train_stars, y_train_funny, y_train_useful, y_train_cool)
+    X_valid, y_valid_stars, y_valid_funny, y_valid_useful, y_valid_cool = preprocess_batch(
+        X_valid_texts, y_valid_stars, y_valid_funny, y_valid_useful, y_valid_cool)
+    X_test, y_test_stars, y_test_funny, y_test_useful, y_test_cool = preprocess_batch(
+        X_test_texts, y_test_stars, y_test_funny, y_test_useful, y_test_cool)
 
-    return X_train, X_valid, X_test, (y_train_stars, y_train_funny, y_train_useful, y_train_cool), (y_valid_stars, y_valid_funny, y_valid_useful, y_valid_cool), (y_test_stars, y_test_funny, y_test_useful, y_test_cool), vocab
+    return X_train, X_valid, X_test, (y_train_stars, y_train_funny, y_train_useful, y_train_cool), (
+        y_valid_stars, y_valid_funny, y_valid_useful, y_valid_cool), (y_test_stars, y_test_funny, y_test_useful, y_test_cool), vocab
 
 class YelpReviewDataset(Dataset):
     def __init__(self, texts, stars, funny, useful, cool):
@@ -221,6 +214,7 @@ def eval_model(model, data_loader, device):
     all_preds = []
     all_labels = []
     mse_funny, mse_useful, mse_cool = 0, 0, 0
+    mae_funny, mae_useful, mae_cool = 0, 0, 0
 
     with torch.no_grad():
         for texts, stars, funny, useful, cool in tqdm(data_loader, desc="Evaluating"):
@@ -250,8 +244,11 @@ def eval_model(model, data_loader, device):
             mse_useful += regression_loss_useful.item() * texts.size(0)
             mse_cool += regression_loss_cool.item() * texts.size(0)
 
+            mae_funny += F.l1_loss(regression_outputs[:, 0], funny).item() * texts.size(0)
+            mae_useful += F.l1_loss(regression_outputs[:, 1], useful).item() * texts.size(0)
+            mae_cool += F.l1_loss(regression_outputs[:, 2], cool).item() * texts.size(0)
+
     classification_accuracy = total_correct / total
-    f1 = f1_score(all_labels, all_preds, average='weighted')
     report = classification_report(all_labels, all_preds)
     avg_classification_loss = total_classification_loss / total
     avg_regression_loss = total_regression_loss / total
@@ -261,9 +258,12 @@ def eval_model(model, data_loader, device):
     rmse_funny = mse_funny ** 0.5
     rmse_useful = mse_useful ** 0.5
     rmse_cool = mse_cool ** 0.5
+    mae_funny /= total
+    mae_useful /= total
+    mae_cool /= total
 
-    return (classification_accuracy, f1, report, avg_classification_loss, avg_regression_loss,
-            mse_funny, mse_useful, mse_cool, rmse_funny, rmse_useful, rmse_cool)
+    return (classification_accuracy, report, avg_classification_loss, avg_regression_loss,
+            mse_funny, mse_useful, mse_cool, rmse_funny, rmse_useful, rmse_cool, mae_funny, mae_useful, mae_cool)
 
 class EarlyStopping:
     def __init__(self, patience=5, delta=0):
@@ -354,13 +354,14 @@ def train_and_evaluate(params, use_small_subset=False):
         train_acc, train_class_loss, train_reg_loss = train_epoch(model, train_loader, optimizer, device, scheduler=None)
         print(f"Train classification loss: {train_class_loss:.4f}, Train regression loss: {train_reg_loss:.4f}, Train accuracy: {train_acc:.4f}")
 
-        (val_acc, val_f1, val_class_loss, val_reg_loss,
+        (val_acc, val_report, val_class_loss, val_reg_loss,
             mse_funny, mse_useful, mse_cool,
-            rmse_funny, rmse_useful, rmse_cool) = eval_model(model, valid_loader, device)
+            rmse_funny, rmse_useful, rmse_cool, mae_funny, mae_useful, mae_cool) = eval_model(model, valid_loader, device)
         
-        print(f"Validation classification loss: {val_class_loss:.4f}, Validation regression loss: {val_reg_loss:.4f}, Validation accuracy: {val_acc:.4f}, Validation F1 score: {val_f1:.4f}")
+        print(f"Validation classification loss: {val_class_loss:.4f}, Validation regression loss: {val_reg_loss:.4f}, Validation accuracy: {val_acc:.4f}")
         print(f"Validation MSE - Funny: {mse_funny:.4f}, Useful: {mse_useful:.4f}, Cool: {mse_cool:.4f}")
         print(f"Validation RMSE - Funny: {rmse_funny:.4f}, Useful: {rmse_useful:.4f}, Cool: {rmse_cool:.4f}")
+        print(f"Validation MAE - Funny: {mae_funny:.4f}, Useful: {mae_useful:.4f}, Cool: {mae_cool:.4f}")
 
         val_loss = val_class_loss + val_reg_loss
         scheduler.step(val_loss)
@@ -401,8 +402,31 @@ def load_model(model, filepath="best_model.pth"):
     return None
 
 if __name__ == '__main__':
+    global remove_low_ratings_flag, remove_top_k_words_flag, train_model, fine_tuning, use_small_subset
+    remove_low_ratings_flag = True
+    remove_top_k_words_flag = False
+    train_model = True
+    fine_tuning = True
+    use_small_subset = True
+    
+    if len(sys.argv) > 1:
+        remove_low_ratings_flag = sys.argv[1]
+    if len(sys.argv) > 2:
+        remove_top_k_words_flag = sys.argv[2]
+    if len(sys.argv) > 3:
+        train_model = sys.argv[3]
+    if len(sys.argv) > 4:
+        fine_tuning = sys.argv[4]
+    if len(sys.argv) > 5:
+        use_small_subset = sys.argv[5]
+
     best_params_filepath = "best_params.json"
-    best_model_filepath = "best_model.pth"
+    if remove_low_ratings_flag:
+        best_model_filepath = "best_model_remove_low_ratings.pth"
+    elif remove_top_k_words_flag:
+        best_model_filepath = "best_model_remove_top_k.pth"
+    else:
+        best_model_filepath = "best_model.pth"
 
     # Load best parameters or perform random search
     best_params = load_params(filepath=best_params_filepath)
@@ -413,9 +437,11 @@ if __name__ == '__main__':
     y_valid_stars, y_valid_funny, y_valid_useful, y_valid_cool = y_valid
     y_test_stars, y_test_funny, y_test_useful, y_test_cool = y_test
 
-    print("Fine tuning: ", fine_tuning)
+    print("Fine-tuning: ", fine_tuning)
     if fine_tuning:
         if best_params is None:
+            start_time = time.time()
+
             # Define the parameter grid for random search
             param_grid = {
                 "embed_size": [50, 100, 200],
@@ -432,6 +458,9 @@ if __name__ == '__main__':
 
             # Save the best parameters
             save_params(best_params, filepath=best_params_filepath)
+
+            end_time = time.time()
+            print(f"Random search completed in {end_time - start_time:.2f} seconds.")
 
         # Use best params to define and train final model
         global EMBED_SIZE, NUM_FILTERS, FILTER_SIZES, DROPOUT_RATE, BATCH_SIZE
@@ -465,6 +494,8 @@ if __name__ == '__main__':
 
     # Load model if it exists, otherwise train and save it
     if not os.path.exists(best_model_filepath) or train_model:
+        start_time = time.time()
+
         optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
         scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=3)
 
@@ -477,13 +508,14 @@ if __name__ == '__main__':
             train_acc, train_class_loss, train_reg_loss = train_epoch(model, train_loader, optimizer, device, scheduler=None)
             print(f"Train classification loss: {train_class_loss:.4f}, Train regression loss: {train_reg_loss:.4f}, Train accuracy: {train_acc:.4f}")
 
-            (val_acc, val_f1, val_class_loss, val_reg_loss,
-             mse_funny, mse_useful, mse_cool,
-             rmse_funny, rmse_useful, rmse_cool) = eval_model(model, valid_loader, device)
+            (val_acc, val_report, val_class_loss, val_reg_loss,
+                mse_funny, mse_useful, mse_cool,
+                rmse_funny, rmse_useful, rmse_cool, mae_funny, mae_useful, mae_cool) = eval_model(model, valid_loader, device)
             
-            print(f"Validation classification loss: {val_class_loss:.4f}, Validation regression loss: {val_reg_loss:.4f}, Validation accuracy: {val_acc:.4f}, Validation F1 score: {val_f1:.4f}")
+            print(f"Validation classification loss: {val_class_loss:.4f}, Validation regression loss: {val_reg_loss:.4f}, Validation accuracy: {val_acc:.4f}")
             print(f"Validation MSE - Funny: {mse_funny:.4f}, Useful: {mse_useful:.4f}, Cool: {mse_cool:.4f}")
             print(f"Validation RMSE - Funny: {rmse_funny:.4f}, Useful: {rmse_useful:.4f}, Cool: {rmse_cool:.4f}")
+            print(f"Validation MAE - Funny: {mae_funny:.4f}, Useful: {mae_useful:.4f}, Cool: {mae_cool:.4f}")
 
             val_loss = val_class_loss + val_reg_loss
             scheduler.step(val_loss)
@@ -495,16 +527,20 @@ if __name__ == '__main__':
 
         print("Training complete. Saving the model.")
         save_model(model, filepath=best_model_filepath)
+
+        end_time = time.time()
+        print(f"Training completed in {end_time - start_time:.2f} seconds.")
     else:
         model = load_model(model, filepath=best_model_filepath)
         if model:
             print("Loaded saved model.")
 
     # Evaluate the final model on the test set
-    (test_acc, test_f1,test_report, test_class_loss, test_reg_loss,
+    (test_acc, test_report, test_class_loss, test_reg_loss,
      mse_funny, mse_useful, mse_cool,
-     rmse_funny, rmse_useful, rmse_cool) = eval_model(model, test_loader, device)
+     rmse_funny, rmse_useful, rmse_cool, mae_funny, mae_useful, mae_cool) = eval_model(model, test_loader, device)
 
-    print(f"Test classification loss: {test_class_loss:.4f}, Test regression loss: {test_reg_loss:.4f}, Test accuracy: {test_acc:.4f}, Test F1 score: {test_f1:.4f}", "\n", test_report)
+    print(f"Test classification loss: {test_class_loss:.4f}, Test regression loss: {test_reg_loss:.4f}, Test accuracy: {test_acc:.4f}", "\n", test_report)
     print(f"Test MSE - Funny: {mse_funny:.4f}, Useful: {mse_useful:.4f}, Cool: {mse_cool:.4f}")
     print(f"Test RMSE - Funny: {rmse_funny:.4f}, Useful: {rmse_useful:.4f}, Cool: {rmse_cool:.4f}")
+    print(f"Test MAE - Funny: {mae_funny:.4f}, Useful: {mae_useful:.4f}, Cool: {mae_cool:.4f}")
